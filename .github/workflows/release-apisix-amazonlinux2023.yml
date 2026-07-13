@@ -1,0 +1,157 @@
+name: Release APISIX for Amazon Linux 2023
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: APISIX version to release; defaults to the latest published version
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-apisix-amazonlinux2023
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.repository == 'opstfmandefi-dotcom/apisix-build-tools'
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve APISIX release
+        id: release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          version="$REQUESTED_VERSION"
+          if [[ -z "$version" ]]; then
+            version=$(gh api repos/apache/apisix/releases/latest --jq .tag_name)
+          fi
+          version=${version#v}
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid APISIX version: $version" >&2
+            exit 1
+          fi
+
+          release_tag="apisix-amazonlinux/${version}"
+          release=true
+          if [[ "${{ github.event_name }}" == "schedule" ]] && gh release view "$release_tag" >/dev/null 2>&1; then
+            release=false
+          fi
+
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.release == 'true'
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            docker_arch: linux/amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            docker_arch: linux/arm64/v8
+            rpm_arch: aarch64
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - name: Check out build tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install dashboard build dependencies
+        run: |
+          sudo n lts
+          corepack enable pnpm
+
+      - name: Resolve APISIX runtime version
+        env:
+          APISIX_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          wget -q "https://raw.githubusercontent.com/apache/apisix/${APISIX_VERSION}/.requirements"
+          runtime_version=$(sed -n 's/^APISIX_RUNTIME=//p' .requirements)
+          test -n "$runtime_version"
+          echo "APISIX_RUNTIME_VERSION=$runtime_version" >> "$GITHUB_ENV"
+
+      - name: Build Amazon Linux 2023 ${{ matrix.platform.rpm_arch }} RPM
+        env:
+          APISIX_VERSION: ${{ needs.resolve.outputs.version }}
+          BUILDKIT_PROGRESS: plain
+        run: |
+          make package type=rpm app=apisix version="${APISIX_VERSION}" checkout="${APISIX_VERSION}" \
+            image_base=amazonlinux image_tag=2023 arch=${{ matrix.platform.docker_arch }} \
+            openresty=apisix-runtime runtime_version="${APISIX_RUNTIME_VERSION}" runtime_code_path=./
+
+      - name: Smoke install on Amazon Linux 2023
+        env:
+          APISIX_VERSION: ${{ needs.resolve.outputs.version }}
+          RPM_ARCH: ${{ matrix.platform.rpm_arch }}
+        run: |
+          rpm="apisix-${APISIX_VERSION}-0.amzn2023.${RPM_ARCH}.rpm"
+          docker run --rm -v "$PWD/output:/output" amazonlinux:2023 bash -euxc "
+            dnf -y localinstall /output/${rpm}
+            rpm -q apisix
+            test -x /usr/bin/apisix
+            test -x /usr/local/openresty/bin/openresty
+            apisix version
+            /usr/local/openresty/bin/openresty -V 2>&1 | grep -q APISIX_RUNTIME_VER
+          "
+
+      - name: Stage release asset
+        env:
+          APISIX_VERSION: ${{ needs.resolve.outputs.version }}
+          RPM_ARCH: ${{ matrix.platform.rpm_arch }}
+        run: |
+          mkdir release-assets
+          cp "output/apisix-${APISIX_VERSION}-0.amzn2023.${RPM_ARCH}.rpm" release-assets/
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: amazonlinux2023-${{ matrix.platform.rpm_arch }}
+          path: release-assets/*.rpm
+          retention-days: 5
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amazonlinux2023-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.rpm --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/*.rpm \
+              --target master \
+              --title "Apache APISIX ${VERSION} for Amazon Linux 2023" \
+              --notes "Amazon Linux 2023 RPMs for Apache APISIX ${VERSION} on x86_64 and ARM64."
+          fi
